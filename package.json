@@ -1,0 +1,14 @@
+{
+  "name": "alleraid-push-backend",
+  "version": "1.0.0",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.18.3",
+    "firebase-admin": "^12.0.0"
+  }
+}
