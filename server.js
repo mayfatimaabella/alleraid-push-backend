@@ -145,21 +145,12 @@ app.post('/send-emergency-push', async (req, res) => {
 });
 
 // ============================
-// REVERSE GEOCODING PROXY
+// REVERSE GEOCODING PROXY (LocationIQ)
 // ============================
 
-// Simple in-memory cache to avoid hammering Nominatim.
+// Simple in-memory cache to avoid excess API calls.
 // Note: this resets on server restart and isn't shared across instances.
 const geocodeCache = new Map();
-
-// Tracks the timestamp of the last outbound request to Nominatim,
-// so we can throttle to their ~1 request/second usage policy.
-let lastNominatimRequestTime = 0;
-const NOMINATIM_MIN_INTERVAL_MS = 1100;
-
-function wait(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
 
 app.get('/reverse-geocode', async (req, res) => {
   try {
@@ -182,6 +173,13 @@ app.get('/reverse-geocode', async (req, res) => {
       });
     }
 
+    if (!process.env.LOCATIONIQ_TOKEN) {
+      return res.status(500).json({
+        success: false,
+        error: 'Missing LOCATIONIQ_TOKEN environment variable'
+      });
+    }
+
     // Round to reduce cache fragmentation from tiny GPS jitter
     const key = `${latNum.toFixed(5)},${lonNum.toFixed(5)}`;
 
@@ -193,27 +191,16 @@ app.get('/reverse-geocode', async (req, res) => {
       });
     }
 
-    // Throttle outbound requests to respect Nominatim's rate limit
-    const now = Date.now();
-    const elapsed = now - lastNominatimRequestTime;
-
-    if (elapsed < NOMINATIM_MIN_INTERVAL_MS) {
-      await wait(NOMINATIM_MIN_INTERVAL_MS - elapsed);
-    }
-
-    lastNominatimRequestTime = Date.now();
-
-    const url = `https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${encodeURIComponent(latNum)}&lon=${encodeURIComponent(lonNum)}`;
+    const url = `https://us1.locationiq.com/v1/reverse?key=${process.env.LOCATIONIQ_TOKEN}&lat=${encodeURIComponent(latNum)}&lon=${encodeURIComponent(lonNum)}&format=json`;
 
     const response = await fetch(url, {
       headers: {
-        // Nominatim's usage policy requires a real identifying User-Agent
-        'User-Agent': 'AllerAid/1.0 (contact: your-email@example.com)'
+        'User-Agent': 'AllerAid/1.0 (contact: mayfatimabella@gmail.com)'
       }
     });
 
     if (!response.ok) {
-      throw new Error(`Nominatim responded with HTTP ${response.status}`);
+      throw new Error(`LocationIQ responded with HTTP ${response.status}`);
     }
 
     const data = await response.json();
