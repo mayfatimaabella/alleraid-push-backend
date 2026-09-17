@@ -1,6 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const admin = require('firebase-admin');
+const fetch = require('node-fetch');
 
 const app = express();
 
@@ -143,6 +144,97 @@ app.post('/send-emergency-push', async (req, res) => {
   }
 });
 
+// ============================
+// REVERSE GEOCODING PROXY
+// ============================
+
+// Simple in-memory cache to avoid hammering Nominatim.
+// Note: this resets on server restart and isn't shared across instances.
+const geocodeCache = new Map();
+
+// Tracks the timestamp of the last outbound request to Nominatim,
+// so we can throttle to their ~1 request/second usage policy.
+let lastNominatimRequestTime = 0;
+const NOMINATIM_MIN_INTERVAL_MS = 1100;
+
+function wait(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+app.get('/reverse-geocode', async (req, res) => {
+  try {
+    const { lat, lon } = req.query;
+
+    if (!lat || !lon) {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing lat or lon query parameter'
+      });
+    }
+
+    const latNum = parseFloat(lat);
+    const lonNum = parseFloat(lon);
+
+    if (Number.isNaN(latNum) || Number.isNaN(lonNum)) {
+      return res.status(400).json({
+        success: false,
+        error: 'lat and lon must be valid numbers'
+      });
+    }
+
+    // Round to reduce cache fragmentation from tiny GPS jitter
+    const key = `${latNum.toFixed(5)},${lonNum.toFixed(5)}`;
+
+    if (geocodeCache.has(key)) {
+      return res.json({
+        success: true,
+        address: geocodeCache.get(key),
+        cached: true
+      });
+    }
+
+    // Throttle outbound requests to respect Nominatim's rate limit
+    const now = Date.now();
+    const elapsed = now - lastNominatimRequestTime;
+
+    if (elapsed < NOMINATIM_MIN_INTERVAL_MS) {
+      await wait(NOMINATIM_MIN_INTERVAL_MS - elapsed);
+    }
+
+    lastNominatimRequestTime = Date.now();
+
+    const url = `https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${encodeURIComponent(latNum)}&lon=${encodeURIComponent(lonNum)}`;
+
+    const response = await fetch(url, {
+      headers: {
+        // Nominatim's usage policy requires a real identifying User-Agent
+        'User-Agent': 'AllerAid/1.0 (contact: your-email@example.com)'
+      }
+    });
+
+    if (!response.ok) {
+      throw new Error(`Nominatim responded with HTTP ${response.status}`);
+    }
+
+    const data = await response.json();
+    const address = data?.display_name || null;
+
+    if (address) {
+      geocodeCache.set(key, address);
+    }
+
+    return res.json({ success: true, address, cached: false });
+
+  } catch (error) {
+    console.error('Reverse geocode error:', error);
+
+    return res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
@@ -151,4 +243,3 @@ app.listen(PORT, () => {
 
 //$env:FIREBASE_SERVICE_ACCOUNT = Get-Content .\serviceAccountKey.json -Raw
 //>> npm start
-
