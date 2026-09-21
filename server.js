@@ -9,7 +9,7 @@ app.use(cors());
 app.use(express.json({ limit: '1mb' }));
 
 
-// FIREBASE INITIALIZATION
+// FIREBASE ADMIN
 
 
 if (!process.env.FIREBASE_SERVICE_ACCOUNT) {
@@ -18,9 +18,17 @@ if (!process.env.FIREBASE_SERVICE_ACCOUNT) {
   );
 }
 
-const serviceAccount = JSON.parse(
-  process.env.FIREBASE_SERVICE_ACCOUNT
-);
+let serviceAccount;
+
+try {
+  serviceAccount = JSON.parse(
+    process.env.FIREBASE_SERVICE_ACCOUNT
+  );
+} catch (error) {
+  throw new Error(
+    'FIREBASE_SERVICE_ACCOUNT is not valid JSON'
+  );
+}
 
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount)
@@ -29,623 +37,637 @@ admin.initializeApp({
 const db = admin.firestore();
 
 
-
 // HEALTH CHECK
 
 
 app.get('/', (req, res) => {
-  res.send('AllerAid push backend is running');
+  res.json({
+    success: true,
+    message: 'AllerAid push backend is running'
+  });
 });
 
 
+// NORMALIZE FCM TOKENS
 
-// FCM TOKEN NORMALIZATION
 
-
-function normalizeTokens(userData) {
+function normalizeTokens(userData = {}) {
   const tokens = [];
 
-  // New format:
-  // pushTokens: ['token1', 'token2']
+  // pushTokens can be:
+  //
+  // [
+  //   "token1",
+  //   "token2"
+  // ]
+  //
+  // OR:
+  //
+  // [
+  //   { token: "token1" },
+  //   { token: "token2" }
+  // ]
 
   if (Array.isArray(userData.pushTokens)) {
     userData.pushTokens.forEach(item => {
       if (typeof item === 'string') {
-        tokens.push(item);
-      }
+        const token = item.trim();
 
-      // Also support:
-      // pushTokens: [{ token: 'token1' }]
+        if (token) {
+          tokens.push(token);
+        }
+      }
 
       if (
         item &&
         typeof item.token === 'string'
       ) {
-        tokens.push(item.token);
+        const token = item.token.trim();
+
+        if (token) {
+          tokens.push(token);
+        }
       }
     });
   }
 
-  // Backwards compatibility:
-  // fcmToken: 'token'
-
+  // Legacy/single token support
   if (
     typeof userData.fcmToken === 'string' &&
     userData.fcmToken.trim()
   ) {
-    tokens.push(userData.fcmToken);
+    tokens.push(
+      userData.fcmToken.trim()
+    );
   }
 
   return [
     ...new Set(
-      tokens
-        .map(token => token.trim())
-        .filter(Boolean)
+      tokens.filter(Boolean)
     )
   ];
 }
 
 
-
-// SEND EMERGENCY PUSH TO RESPONDERS
-
-
-app.post('/send-emergency-push', async (req, res) => {
-  try {
-    console.log(
-      'Received push request:',
-      JSON.stringify(req.body, null, 2)
-    );
-
-    const {
-      responderIds,
-      message
-    } = req.body;
+// SEND EMERGENCY PUSH
 
 
-    
-    // VALIDATE RESPONDER IDS
-    
-
-    if (
-      !Array.isArray(responderIds) ||
-      responderIds.length === 0
-    ) {
-      return res.status(400).json({
-        success: false,
-        error: 'Missing responderIds'
-      });
-    }
-
-
-    // Remove invalid and duplicate IDs
-
-    const uniqueResponderIds = [
-      ...new Set(
-        responderIds.filter(
-          id =>
-            typeof id === 'string' &&
-            id.trim().length > 0
-        )
-      )
-    ];
-
-
-    if (uniqueResponderIds.length === 0) {
-      return res.status(400).json({
-        success: false,
-        error: 'No valid responder IDs provided'
-      });
-    }
-
-
-    
-    // VALIDATE MESSAGE
-    
-
-    if (!message) {
-      return res.status(400).json({
-        success: false,
-        error: 'Missing message'
-      });
-    }
-
-
-    console.log(
-      'Target responder IDs:',
-      uniqueResponderIds
-    );
-
-
-    
-    // GET RESPONDER DOCUMENTS
-    
-
-    const responderDocs = await Promise.all(
-      uniqueResponderIds.map(responderId =>
-        db
-          .collection('users')
-          .doc(responderId)
-          .get()
-      )
-    );
-
-
-    
-    // COLLECT FCM TOKENS
-    
-
-    const allTokens = [];
-
-    const respondersFound = [];
-
-    const respondersNotFound = [];
-
-    const respondersWithoutTokens = [];
-
-
-    for (let i = 0; i < responderDocs.length; i++) {
-
-      const responderDoc = responderDocs[i];
-
-      const responderId =
-        uniqueResponderIds[i];
-
-
-      // Responder does not exist
-
-      if (!responderDoc.exists) {
-
-        console.warn(
-          `Responder not found: ${responderId}`
-        );
-
-        respondersNotFound.push(
-          responderId
-        );
-
-        continue;
-      }
-
-
-      respondersFound.push(
-        responderId
-      );
-
-
-      const userData =
-        responderDoc.data();
-
-
-      const responderTokens =
-        normalizeTokens(userData);
+app.post(
+  '/send-emergency-push',
+  async (req, res) => {
+    try {
 
 
       console.log(
-        `Responder ${responderId} has ${responderTokens.length} push token(s)`
+        'Received emergency push request:'
       );
 
+      console.log(
+        JSON.stringify(
+          req.body,
+          null,
+          2
+        )
+      );
 
-      if (responderTokens.length === 0) {
+      const {
+        targetUserId,
+        responderIds,
+        message
+      } = req.body;
 
-        respondersWithoutTokens.push(
-          responderId
-        );
+      
+      // VALIDATE TARGET USER
+      
 
-        continue;
+      if (
+        typeof targetUserId !== 'string' ||
+        !targetUserId.trim()
+      ) {
+        return res.status(400).json({
+          success: false,
+          error: 'Missing targetUserId'
+        });
       }
 
+      
+      // VALIDATE MESSAGE
+      
 
-      allTokens.push(
-        ...responderTokens
+      if (
+        !message ||
+        typeof message !== 'object'
+      ) {
+        return res.status(400).json({
+          success: false,
+          error: 'Missing message'
+        });
+      }
+
+      const cleanTargetUserId =
+        targetUserId.trim();
+
+      
+      // GET USER
+      
+
+      const userRef =
+        db
+          .collection('users')
+          .doc(cleanTargetUserId);
+
+      const userDoc =
+        await userRef.get();
+
+      if (!userDoc.exists) {
+        return res.status(404).json({
+          success: false,
+          error: 'Target user not found',
+          targetUserId: cleanTargetUserId
+        });
+      }
+
+      const userData =
+        userDoc.data() || {};
+
+      
+      // GET FCM TOKENS
+      
+
+      const tokens =
+        normalizeTokens(userData);
+
+      console.log(
+        'Target user:',
+        cleanTargetUserId
       );
-    }
 
+      console.log(
+        'Resolved FCM token count:',
+        tokens.length
+      );
 
-    // Remove duplicate FCM tokens
+      if (tokens.length === 0) {
+        return res.status(404).json({
+          success: false,
+          error:
+            'No valid push tokens found for this user',
+          targetUserId:
+            cleanTargetUserId
+        });
+      }
 
-    const tokens = [
-      ...new Set(allTokens)
-    ];
+      
+      // CREATE FCM PAYLOAD
+      
 
+      const title =
+        typeof message.title === 'string' &&
+        message.title.trim()
+          ? message.title.trim()
+          : 'Emergency Alert';
 
-    console.log(
-      'Total unique FCM tokens:',
-      tokens.length
-    );
+      const body =
+        typeof message.body === 'string' &&
+        message.body.trim()
+          ? message.body.trim()
+          : 'A buddy needs emergency assistance.';
 
+      const messageData =
+        message.data &&
+        typeof message.data === 'object'
+          ? message.data
+          : {};
 
-    
-    // NO TOKENS FOUND
-    
+      const payload = {
+        notification: {
+          title,
+          body
+        },
 
-    if (tokens.length === 0) {
-
-      return res.status(404).json({
-        success: false,
-
-        error:
-          'No valid push tokens found for the specified responders',
-
-        respondersFound,
-
-        respondersNotFound,
-
-        respondersWithoutTokens
-      });
-    }
-
-
-    
-    // CREATE FCM PAYLOAD
-    
-
-    const payload = {
-
-      notification: {
-
-        title:
-          message.title ||
-          'EMERGENCY ALERT',
-
-        body:
-          message.body ||
-          'A buddy needs emergency assistance.'
-      },
-
-
-      data: {
-
-        type:
-          String(
-            message.data?.type ||
+        data: {
+          type: String(
+            messageData.type ||
             'emergency'
           ),
 
-        emergencyId:
-          String(
-            message.data?.emergencyId ||
+          emergencyId: String(
+            messageData.emergencyId ||
             ''
           ),
 
-        patientName:
-          String(
-            message.data?.patientName ||
+          patientName: String(
+            messageData.patientName ||
             ''
           ),
 
-        allergies:
-          String(
-            message.data?.allergies ||
+          allergies: String(
+            messageData.allergies ||
             ''
           ),
 
-        instructions:
-          String(
-            message.data?.instructions ||
+          instructions: String(
+            messageData.instructions ||
             ''
           ),
 
-        location:
-          String(
-            message.data?.location ||
+          location: String(
+            messageData.location ||
             ''
           ),
 
-        profileDetails:
-          String(
-            message.data?.profileDetails ||
+          profileDetails: String(
+            messageData.profileDetails ||
             ''
           )
-      },
+        },
 
+        tokens
+      };
 
-      tokens
-    };
+      console.log(
+        'Sending FCM notification:',
+        JSON.stringify(
+          {
+            title,
+            body,
+            tokenCount: tokens.length
+          },
+          null,
+          2
+        )
+      );
 
+      
+      // SEND FCM
+      
 
-    console.log(
-      'Sending FCM notification to',
-      tokens.length,
-      'device(s)'
-    );
+      const response =
+        await admin
+          .messaging()
+          .sendEachForMulticast(
+            payload
+          );
 
+      
+      // PROCESS FAILURES
+      
 
-    
-    // SEND FCM NOTIFICATION
-    
+      const failures =
+        response.responses
+          .map(
+            (result, index) => {
+              if (result.success) {
+                return null;
+              }
 
-    const response =
-      await admin
-        .messaging()
-        .sendEachForMulticast(payload);
+              return {
+                token:
+                  tokens[index],
 
+                code:
+                  result.error?.code ||
+                  'unknown',
 
-    
-    // HANDLE FAILED TOKENS
-    
+                message:
+                  result.error?.message ||
+                  'Unknown FCM error'
+              };
+            }
+          )
+          .filter(Boolean);
 
-    const failures =
-      response.responses
-        .map((result, index) => {
+      
+      // REMOVE INVALID TOKENS
+      
 
-          if (result.success) {
-            return null;
-          }
+      const invalidTokenCodes = new Set([
+        'messaging/invalid-registration-token',
+        'messaging/registration-token-not-registered'
+      ]);
 
+      const invalidTokens =
+        response.responses
+          .map(
+            (result, index) => {
+              if (
+                result.success ||
+                !result.error
+              ) {
+                return null;
+              }
 
-          return {
+              if (
+                invalidTokenCodes.has(
+                  result.error.code
+                )
+              ) {
+                return tokens[index];
+              }
 
-            token:
-              tokens[index],
+              return null;
+            }
+          )
+          .filter(Boolean);
 
-            code:
-              result.error?.code ||
-              null,
+      if (
+        invalidTokens.length > 0
+      ) {
+        console.log(
+          'Invalid FCM tokens:',
+          invalidTokens.length
+        );
 
-            message:
-              result.error?.message ||
-              null
-          };
-        })
-        .filter(Boolean);
+        const currentPushTokens =
+          Array.isArray(
+            userData.pushTokens
+          )
+            ? userData.pushTokens
+            : [];
 
+        const cleanedTokens =
+          currentPushTokens.filter(
+            item => {
+              const token =
+                typeof item === 'string'
+                  ? item
+                  : item?.token;
 
-    
-    // LOG RESULT
-    
+              return (
+                typeof token !== 'string' ||
+                !invalidTokens.includes(
+                  token
+                )
+              );
+            }
+          );
 
-    console.log(
-      'FCM result:',
-      {
+        try {
+          await userRef.update({
+            pushTokens:
+              cleanedTokens
+          });
+        } catch (cleanupError) {
+          console.warn(
+            'Could not clean invalid FCM tokens:',
+            cleanupError
+          );
+        }
+      }
+
+      
+      // LOG RESULT
+      
+
+      console.log(
+        'FCM result:',
+        {
+          sent:
+            response.successCount,
+
+          failed:
+            response.failureCount,
+
+          failures
+        }
+      );
+
+      console.log(
+        'Responder IDs:',
+        responderIds || []
+      );
+
+      
+      // RESPONSE
+      
+
+      return res.json({
+        success:
+          response.successCount > 0,
+
         sent:
           response.successCount,
 
         failed:
           response.failureCount,
 
-        respondersFound,
-
-        respondersNotFound,
-
-        respondersWithoutTokens,
+        targetUserId:
+          cleanTargetUserId,
 
         failures
-      }
-    );
+      });
 
+    } catch (error) {
+      console.error(
+        '======================================'
+      );
 
-    
-    // RESPONSE TO ANGULAR
-    
+      console.error(
+        'Push error:',
+        error
+      );
 
-    return res.json({
+      console.error(
+        '======================================'
+      );
 
-      success:
-        response.successCount > 0,
-
-      sent:
-        response.successCount,
-
-      failed:
-        response.failureCount,
-
-      respondersFound,
-
-      respondersNotFound,
-
-      respondersWithoutTokens,
-
-      failures
-    });
-
-
-  } catch (error) {
-
-    console.error(
-      'Push error:',
-      error
-    );
-
-
-    return res.status(500).json({
-
-      success: false,
-
-      error:
-        error.message
-    });
+      return res.status(500).json({
+        success: false,
+        error:
+          error?.message ||
+          'Internal server error'
+      });
+    }
   }
-});
+);
 
 
+// LOCATIONIQ REVERSE GEOCODING
 
-// REVERSE GEOCODING PROXY
-// LOCATIONIQ
-
-
-// Simple in-memory cache.
-// This resets when the server restarts.
 
 const geocodeCache =
   new Map();
 
+app.get(
+  '/reverse-geocode',
+  async (req, res) => {
+    try {
+      const {
+        lat,
+        lon
+      } = req.query;
 
-app.get('/reverse-geocode', async (req, res) => {
+      if (
+        lat === undefined ||
+        lon === undefined
+      ) {
+        return res.status(400).json({
+          success: false,
+          error:
+            'Missing lat or lon query parameter'
+        });
+      }
 
-  try {
+      const latNum =
+        Number(lat);
 
-    const {
-      lat,
-      lon
-    } = req.query;
+      const lonNum =
+        Number(lon);
 
+      if (
+        !Number.isFinite(latNum) ||
+        !Number.isFinite(lonNum)
+      ) {
+        return res.status(400).json({
+          success: false,
+          error:
+            'lat and lon must be valid numbers'
+        });
+      }
 
-    
-    // VALIDATE PARAMETERS
-    
+      if (
+        latNum < -90 ||
+        latNum > 90 ||
+        lonNum < -180 ||
+        lonNum > 180
+      ) {
+        return res.status(400).json({
+          success: false,
+          error:
+            'Invalid latitude or longitude'
+        });
+      }
 
-    if (!lat || !lon) {
+      if (
+        !process.env.LOCATIONIQ_TOKEN
+      ) {
+        return res.status(500).json({
+          success: false,
+          error:
+            'Missing LOCATIONIQ_TOKEN environment variable'
+        });
+      }
 
-      return res.status(400).json({
+      // Reduce GPS jitter
+      const key =
+        `${latNum.toFixed(5)},${lonNum.toFixed(5)}`;
 
-        success: false,
+      if (
+        geocodeCache.has(key)
+      ) {
+        return res.json({
+          success: true,
+          address:
+            geocodeCache.get(key),
+          cached: true
+        });
+      }
 
-        error:
-          'Missing lat or lon query parameter'
-      });
-    }
+      const url =
+        'https://us1.locationiq.com/v1/reverse' +
+        `?key=${encodeURIComponent(
+          process.env.LOCATIONIQ_TOKEN
+        )}` +
+        `&lat=${encodeURIComponent(
+          latNum
+        )}` +
+        `&lon=${encodeURIComponent(
+          lonNum
+        )}` +
+        '&format=json';
 
+      const response =
+        await fetch(
+          url,
+          {
+            headers: {
+              'User-Agent':
+                'AllerAid/1.0 (contact: mayfatimabella@gmail.com)',
+              'Accept':
+                'application/json'
+            }
+          }
+        );
 
-    const latNum =
-      parseFloat(lat);
+      if (!response.ok) {
+        const responseText =
+          await response.text();
 
-    const lonNum =
-      parseFloat(lon);
+        throw new Error(
+          `LocationIQ responded with HTTP ${response.status}: ${responseText}`
+        );
+      }
 
+      const data =
+        await response.json();
 
-    if (
-      Number.isNaN(latNum) ||
-      Number.isNaN(lonNum)
-    ) {
+      const address =
+        typeof data?.display_name ===
+        'string'
+          ? data.display_name
+          : null;
 
-      return res.status(400).json({
-
-        success: false,
-
-        error:
-          'lat and lon must be valid numbers'
-      });
-    }
-
-
-    
-    // LOCATIONIQ TOKEN
-    
-
-    if (!process.env.LOCATIONIQ_TOKEN) {
-
-      return res.status(500).json({
-
-        success: false,
-
-        error:
-          'Missing LOCATIONIQ_TOKEN environment variable'
-      });
-    }
-
-
-    
-    // CACHE KEY
-    
-
-    const key =
-      `${latNum.toFixed(5)},${lonNum.toFixed(5)}`;
-
-
-    
-    // RETURN CACHED ADDRESS
-    
-
-    if (geocodeCache.has(key)) {
+      if (address) {
+        geocodeCache.set(
+          key,
+          address
+        );
+      }
 
       return res.json({
-
         success: true,
-
-        address:
-          geocodeCache.get(key),
-
-        cached: true
-      });
-    }
-
-
-    
-    // LOCATIONIQ REQUEST
-    
-
-    const url =
-      `https://us1.locationiq.com/v1/reverse` +
-      `?key=${process.env.LOCATIONIQ_TOKEN}` +
-      `&lat=${encodeURIComponent(latNum)}` +
-      `&lon=${encodeURIComponent(lonNum)}` +
-      `&format=json`;
-
-
-    const response =
-      await fetch(url, {
-
-        headers: {
-
-          'User-Agent':
-            'AllerAid/1.0 (contact: mayfatimabella@gmail.com)'
-        }
+        address,
+        cached: false
       });
 
-
-    if (!response.ok) {
-
-      throw new Error(
-        `LocationIQ responded with HTTP ${response.status}`
+    } catch (error) {
+      console.error(
+        'Reverse geocode error:',
+        error
       );
+
+      return res.status(500).json({
+        success: false,
+        error:
+          error?.message ||
+          'Reverse geocoding failed'
+      });
     }
+  }
+);
 
 
-    const data =
-      await response.json();
+// 404
 
 
-    const address =
-      data?.display_name ||
-      null;
-
-
-    
-    // CACHE ADDRESS
-    
-
-    if (address) {
-
-      geocodeCache.set(
-        key,
-        address
-      );
-    }
-
-
-    
-    // RESPONSE
-    
-
-    return res.json({
-
-      success: true,
-
-      address,
-
-      cached: false
+app.use(
+  (req, res) => {
+    res.status(404).json({
+      success: false,
+      error: 'Endpoint not found'
     });
+  }
+);
 
 
-  } catch (error) {
+// ERROR HANDLER
 
+
+app.use(
+  (error, req, res, next) => {
     console.error(
-      'Reverse geocode error:',
+      'Unhandled Express error:',
       error
     );
 
-
-    return res.status(500).json({
-
+    res.status(500).json({
       success: false,
-
       error:
-        error.message
+        error?.message ||
+        'Internal server error'
     });
   }
-});
-
+);
 
 
 // START SERVER
@@ -654,24 +676,11 @@ app.get('/reverse-geocode', async (req, res) => {
 const PORT =
   process.env.PORT || 3000;
 
-
-app.listen(PORT, () => {
-
-  console.log(
-    `AllerAid push backend running on port ${PORT}`
-  );
-});
-
-
-
-// LOCAL DEVELOPMENT
-
-//
-// PowerShell:
-//
-// $env:FIREBASE_SERVICE_ACCOUNT =
-//   Get-Content .\serviceAccountKey.json -Raw
-//
-// npm start
-//
-
+app.listen(
+  PORT,
+  () => {
+    console.log(
+      `AllerAid push backend running on port ${PORT}`
+    );
+  }
+);
